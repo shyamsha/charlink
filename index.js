@@ -23,7 +23,7 @@ require("dotenv").config();
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const { TelegramBot } = require("node-telegram-bot-api");
+const { TelegramBot } = require("node-telegram-bot-api"); // v1.x: TelegramBot is a named export, not default
 
 const app = express();
 app.use(express.json());
@@ -31,6 +31,11 @@ app.use(express.urlencoded({ extended: true })); // Chartink sometimes posts for
 
 const PORT = process.env.PORT || 3000;
 const STATE_FILE = path.join(__dirname, "scan_state.json");
+
+// Exact scan_name text Chartink sends for the two scans you want to combine.
+// Must match exactly what appears in the "scan_name" field of the webhook payload.
+const SCAN_A_NAME = process.env.SCAN_A_NAME || "";
+const SCAN_B_NAME = process.env.SCAN_B_NAME || "";
 
 const bot = process.env.TELEGRAM_BOT_TOKEN
   ? new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false })
@@ -71,6 +76,15 @@ function diffStocks(previous, current) {
   return { added, removed };
 }
 
+// ---------- Cross-scan intersection logic ----------
+// A stock counts as a combined signal only while it matches BOTH configured scans.
+function computeIntersection(state) {
+  if (!SCAN_A_NAME || !SCAN_B_NAME) return null; // feature disabled unless both names are set
+  const listA = state.scans?.[SCAN_A_NAME] || [];
+  const listB = state.scans?.[SCAN_B_NAME] || [];
+  return listA.filter((s) => listB.includes(s));
+}
+
 // ---------- Webhook endpoint ----------
 app.post("/webhook", async (req, res) => {
   try {
@@ -88,24 +102,52 @@ app.post("/webhook", async (req, res) => {
       .filter(Boolean);
 
     const state = loadState();
-    const previousStocks = state[scanName] || [];
+    if (!state.scans) state.scans = {}; // per-scan stock lists, keyed by scan_name
+    if (!state.intersection) state.intersection = []; // last known A∩B list
 
+    const previousStocks = state.scans[scanName] || [];
     const { added, removed } = diffStocks(previousStocks, currentStocks);
 
+    // Per-scan added/removed alerts (unchanged behavior)
     if (removed.length > 0) {
       const msg = `🔴 *Exited: ${scanName}*\n${removed.join(", ")}\n${payload.triggered_at || ""}`;
       console.log(msg);
       await sendTelegramAlert(msg);
     }
-
     if (added.length > 0) {
       const msg = `🟢 *Entered: ${scanName}*\n${added.join(", ")}\n${payload.triggered_at || ""}`;
       console.log(msg);
       await sendTelegramAlert(msg);
     }
 
-    // Update stored state for next comparison
-    state[scanName] = currentStocks;
+    // Update this scan's stored list
+    state.scans[scanName] = currentStocks;
+
+    // ---- Cross-scan intersection check (only runs if SCAN_A_NAME + SCAN_B_NAME are set) ----
+    const newIntersection = computeIntersection(state);
+    if (newIntersection !== null) {
+      const prevIntersection = state.intersection;
+      const enteredBoth = newIntersection.filter(
+        (s) => !prevIntersection.includes(s),
+      );
+      const exitedBoth = prevIntersection.filter(
+        (s) => !newIntersection.includes(s),
+      );
+
+      if (enteredBoth.length > 0) {
+        const msg = `🟢 *ENTER (matched both filters)*\n${enteredBoth.join(", ")}\n${payload.triggered_at || ""}`;
+        console.log(msg);
+        await sendTelegramAlert(msg);
+      }
+      if (exitedBoth.length > 0) {
+        const msg = `🔴 *EXIT (no longer matching both)*\n${exitedBoth.join(", ")}\n${payload.triggered_at || ""}`;
+        console.log(msg);
+        await sendTelegramAlert(msg);
+      }
+
+      state.intersection = newIntersection;
+    }
+
     saveState(state);
 
     res.status(200).send("OK");
