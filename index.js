@@ -219,6 +219,24 @@ const TARGET_SCAN_NAME = process.env.TARGET_SCAN_NAME || "Top Gainers";
 // Paper trading config — SIMULATION ONLY, no real broker, no real money.
 const PAPER_TRADE_QTY = Number(process.env.PAPER_TRADE_QTY) || 1;
 
+// Daily profit target: once today's NET P&L (after charges) hits this, close all
+// open paper positions and stop opening new ones until the next trading day.
+const PROFIT_TARGET = Number(process.env.PROFIT_TARGET) || 3000;
+
+// ---------- IST date helper (for daily reset of profit target / halt flag) ----------
+function getISTDateString() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }); // 'YYYY-MM-DD'
+}
+
+function ensureDailyReset(state) {
+  const today = getISTDateString();
+  if (state.today !== today) {
+    state.today = today;
+    state.dailyNetPnl = 0;
+    state.tradingHalted = false;
+  }
+}
+
 // ---------- Cost model (SIMULATION) ----------
 // Approximate Indian intraday equity charges. Rates vary by broker/plan — treat as
 // directional, not exact; adjust env vars to match your real broker if precision matters.
@@ -327,6 +345,14 @@ function closePaperPosition(state, symbol, exitPrice, time) {
   if (!state.paperPositions || !state.paperPositions[symbol]) return null;
   const pos = state.paperPositions[symbol];
 
+  // Fallback if we never got a price for this symbol on the way out (edge case)
+  if (exitPrice === undefined || exitPrice === null || isNaN(exitPrice)) {
+    console.warn(
+      `[paper trade] No exit price available for ${symbol}, using entry price as fallback`,
+    );
+    exitPrice = pos.entryPrice;
+  }
+
   const grossPnl = (exitPrice - pos.entryPrice) * pos.qty;
   const charges = calculateCharges(pos.entryPrice, exitPrice, pos.qty);
   const netPnl = grossPnl - charges.totalCharges;
@@ -353,6 +379,7 @@ function closePaperPosition(state, symbol, exitPrice, time) {
   state.totalCharges = Number(
     ((state.totalCharges || 0) + charges.totalCharges).toFixed(2),
   );
+  state.dailyNetPnl = Number(((state.dailyNetPnl || 0) + netPnl).toFixed(2));
 
   delete state.paperPositions[symbol];
   return trade;
@@ -387,14 +414,21 @@ app.post("/webhook", async (req, res) => {
     const state = loadState();
     if (!state.stocks) state.stocks = []; // last known list for the target scan
     if (!state.lastPrice) state.lastPrice = {};
+    ensureDailyReset(state); // resets dailyNetPnl / tradingHalted at the start of each new IST trading day
 
     const priceMap = parsePrices(payload, currentStocks);
     Object.assign(state.lastPrice, priceMap);
 
     const { added, removed } = diffStocks(state.stocks, currentStocks);
 
-    // Newly appeared -> paper buy
+    // Newly appeared -> paper buy (skipped once today's profit target has been hit)
     for (const symbol of added) {
+      if (state.tradingHalted) {
+        console.log(
+          `[halted] Skipping buy for ${symbol} — daily profit target already hit`,
+        );
+        continue;
+      }
       const price = state.lastPrice[symbol];
       openPaperPosition(state, symbol, price, payload.triggered_at);
       const msg = `🟢 *PAPER BUY*\n${symbol} @ ${price ?? "N/A"} x${PAPER_TRADE_QTY}\n${payload.triggered_at || ""}`;
@@ -418,11 +452,39 @@ app.post("/webhook", async (req, res) => {
           `Gross P&L: ₹${trade.grossPnl}\n` +
           `Charges: ₹${trade.charges.totalCharges} (brokerage ₹${trade.charges.brokerage}, STT ₹${trade.charges.stt}, exch ₹${trade.charges.exchangeTxn}, SEBI ₹${trade.charges.sebi}, stamp ₹${trade.charges.stampDuty}, GST ₹${trade.charges.gst})\n` +
           `*Net P&L: ₹${trade.netPnl} (${trade.netPnlPct}%)*\n` +
-          `Running total net P&L: ₹${state.totalNetPnl}\n` +
+          `Today's Net P&L: ₹${state.dailyNetPnl} | All-time: ₹${state.totalNetPnl}\n` +
           `${payload.triggered_at || ""}`;
         console.log(msg);
         await sendTelegramAlert(msg);
       }
+    }
+
+    // ---- Daily profit target check: force-close everything and halt for the day ----
+    if (!state.tradingHalted && state.dailyNetPnl >= PROFIT_TARGET) {
+      const openSymbols = Object.keys(state.paperPositions || {});
+      for (const symbol of openSymbols) {
+        const price = state.lastPrice[symbol];
+        const trade = closePaperPosition(
+          state,
+          symbol,
+          price,
+          payload.triggered_at,
+        );
+        if (trade) {
+          const msg =
+            `🎯 *Target-hit auto exit*\n${symbol}: entry ₹${trade.entryPrice} → exit ₹${trade.exitPrice} x${trade.qty}\n` +
+            `Net P&L: ₹${trade.netPnl}`;
+          console.log(msg);
+          await sendTelegramAlert(msg);
+        }
+      }
+      state.tradingHalted = true;
+      const summaryMsg =
+        `🎯 *Daily profit target ₹${PROFIT_TARGET} reached!*\n` +
+        `All open positions closed. No new trades until tomorrow.\n` +
+        `*Today's Net P&L: ₹${state.dailyNetPnl}*`;
+      console.log(summaryMsg);
+      await sendTelegramAlert(summaryMsg);
     }
 
     state.stocks = currentStocks;
@@ -443,6 +505,10 @@ app.get("/trades", (req, res) => {
   const state = loadState();
   res.json({
     targetScan: TARGET_SCAN_NAME,
+    profitTarget: PROFIT_TARGET,
+    today: state.today || null,
+    dailyNetPnl: state.dailyNetPnl || 0,
+    tradingHalted: state.tradingHalted || false,
     openPositions: state.paperPositions || {},
     closedTrades: state.tradeLog || [],
     totalGrossPnl: state.totalGrossPnl || 0,
