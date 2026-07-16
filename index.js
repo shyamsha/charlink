@@ -56,6 +56,10 @@ const PAPER_TRADE_QTY = Number(process.env.PAPER_TRADE_QTY) || 1;
 // open paper positions and stop opening new ones until the next trading day.
 const PROFIT_TARGET = Number(process.env.PROFIT_TARGET) || 3000;
 
+// Daily stop-loss: once today's NET P&L (after charges) drops to this much in the
+// red, close all open paper positions and stop opening new ones for the day.
+const DAILY_STOP_LOSS_RS = Number(process.env.DAILY_STOP_LOSS_RS) || 2000;
+
 // Per-trade take-profit: exit the moment price rises this many rupees above entry,
 // regardless of whether the stock is still in the scan.
 const TAKE_PROFIT_RS = Number(process.env.TAKE_PROFIT_RS) || 3;
@@ -331,31 +335,51 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // ---- Daily profit target check: force-close everything and halt for the day ----
+    // ---- Daily limit check: force-close everything and halt for the day, in either direction ----
+    let dailyLimitHit = null;
     if (!state.tradingHalted && state.dailyNetPnl >= PROFIT_TARGET) {
+      dailyLimitHit = "profit_target";
+    } else if (
+      !state.tradingHalted &&
+      state.dailyNetPnl <= -DAILY_STOP_LOSS_RS
+    ) {
+      dailyLimitHit = "stop_loss";
+    }
+
+    if (dailyLimitHit) {
       const openSymbols = Object.keys(state.paperPositions || {});
       for (const symbol of openSymbols) {
         const price = state.lastPrice[symbol];
+        const reason =
+          dailyLimitHit === "profit_target"
+            ? "daily_target_hit"
+            : "daily_stop_loss_hit";
         const trade = closePaperPosition(
           state,
           symbol,
           price,
           payload.triggered_at,
-          "daily_target_hit",
+          reason,
         );
         if (trade) {
+          const emoji = dailyLimitHit === "profit_target" ? "🎯" : "🛑";
           const msg =
-            `🎯 *Target-hit auto exit*\n${symbol}: entry ₹${trade.entryPrice} → exit ₹${trade.exitPrice} x${trade.qty}\n` +
+            `${emoji} *${dailyLimitHit === "profit_target" ? "Target-hit" : "Stop-loss-hit"} auto exit*\n${symbol}: entry ₹${trade.entryPrice} → exit ₹${trade.exitPrice} x${trade.qty}\n` +
             `Net P&L: ₹${trade.netPnl}`;
           console.log(msg);
           await sendTelegramAlert(msg);
         }
       }
       state.tradingHalted = true;
+
       const summaryMsg =
-        `🎯 *Daily profit target ₹${PROFIT_TARGET} reached!*\n` +
-        `All open positions closed. No new trades until tomorrow.\n` +
-        `*Today's Net P&L: ₹${state.dailyNetPnl}*`;
+        dailyLimitHit === "profit_target"
+          ? `🎯 *Daily profit target ₹${PROFIT_TARGET} reached!*\n` +
+            `All open positions closed. No new trades until tomorrow.\n` +
+            `*Today's Net P&L: ₹${state.dailyNetPnl}*`
+          : `🛑 *Daily stop-loss ₹${DAILY_STOP_LOSS_RS} hit!*\n` +
+            `All open positions closed. No new trades until tomorrow.\n` +
+            `*Today's Net P&L: ₹${state.dailyNetPnl}*`;
       console.log(summaryMsg);
       await sendTelegramAlert(summaryMsg);
     }
@@ -379,6 +403,7 @@ app.get("/trades", (req, res) => {
   res.json({
     targetScan: TARGET_SCAN_NAME,
     profitTarget: PROFIT_TARGET,
+    dailyStopLoss: DAILY_STOP_LOSS_RS,
     today: state.today || null,
     dailyNetPnl: state.dailyNetPnl || 0,
     tradingHalted: state.tradingHalted || false,
