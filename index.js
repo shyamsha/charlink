@@ -1,170 +1,3 @@
-// /**
-//  * chartink-removed-stock-webhook.js
-//  *
-//  * Chartink does NOT send a "stock removed from scan" event natively.
-//  * It only POSTs the list of stocks currently matching, on every alert cycle.
-//  * This server detects "removed" stocks by diffing each new payload against
-//  * the previous one (per scan_name), then fires a Telegram alert for exits.
-//  *
-//  * SETUP:
-//  *   npm install express node-telegram-bot-api dotenv
-//  *
-//  * .env file:
-//  *   PORT=3000
-//  *   TELEGRAM_BOT_TOKEN=xxxxx
-//  *   TELEGRAM_CHAT_ID=xxxxx
-//  *
-//  * CHARTINK SETUP:
-//  *   Scanner -> Create Alert -> Webhook URL -> https://your-server.com/webhook
-//  *   (Chartink pings this URL every time the scan re-evaluates, e.g. every 1-5 min)
-//  */
-
-// require("dotenv").config();
-// const express = require("express");
-// const fs = require("fs");
-// const path = require("path");
-// const { TelegramBot } = require("node-telegram-bot-api"); // v1.x: TelegramBot is a named export, not default
-
-// const app = express();
-// app.use(express.json());
-// app.use(express.urlencoded({ extended: true })); // Chartink sometimes posts form-encoded
-
-// const PORT = process.env.PORT || 3000;
-// const STATE_FILE = path.join(__dirname, "scan_state.json");
-
-// // Exact scan_name text Chartink sends for the two scans you want to combine.
-// // Must match exactly what appears in the "scan_name" field of the webhook payload.
-// const SCAN_A_NAME = process.env.SCAN_A_NAME || "";
-// const SCAN_B_NAME = process.env.SCAN_B_NAME || "";
-
-// const bot = process.env.TELEGRAM_BOT_TOKEN
-//   ? new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false })
-//   : null;
-
-// // ---------- State persistence (per scan_name) ----------
-// function loadState() {
-//   try {
-//     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-//   } catch (e) {
-//     return {}; // first run, no file yet
-//   }
-// }
-
-// function saveState(state) {
-//   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-// }
-
-// // ---------- Alert sender ----------
-// async function sendTelegramAlert(message) {
-//   if (!bot || !process.env.TELEGRAM_CHAT_ID) {
-//     console.log("[Telegram not configured] Would have sent:", message);
-//     return;
-//   }
-//   try {
-//     await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, {
-//       parse_mode: "Markdown",
-//     });
-//   } catch (err) {
-//     console.error("Telegram send failed:", err.message);
-//   }
-// }
-
-// // ---------- Core diff logic ----------
-// function diffStocks(previous, current) {
-//   const removed = previous.filter((s) => !current.includes(s));
-//   const added = current.filter((s) => !previous.includes(s));
-//   return { added, removed };
-// }
-
-// // ---------- Cross-scan intersection logic ----------
-// // A stock counts as a combined signal only while it matches BOTH configured scans.
-// function computeIntersection(state) {
-//   if (!SCAN_A_NAME || !SCAN_B_NAME) return null; // feature disabled unless both names are set
-//   const listA = state.scans?.[SCAN_A_NAME] || [];
-//   const listB = state.scans?.[SCAN_B_NAME] || [];
-//   return listA.filter((s) => listB.includes(s));
-// }
-
-// // ---------- Webhook endpoint ----------
-// app.post("/webhook", async (req, res) => {
-//   try {
-//     const payload = req.body;
-
-//     if (!payload.stocks || !payload.scan_name) {
-//       console.warn("Malformed payload received:", payload);
-//       return res.status(400).send("Missing stocks or scan_name");
-//     }
-
-//     const scanName = payload.scan_name;
-//     const currentStocks = payload.stocks
-//       .split(",")
-//       .map((s) => s.trim())
-//       .filter(Boolean);
-
-//     const state = loadState();
-//     if (!state.scans) state.scans = {}; // per-scan stock lists, keyed by scan_name
-//     if (!state.intersection) state.intersection = []; // last known A∩B list
-
-//     const previousStocks = state.scans[scanName] || [];
-//     const { added, removed } = diffStocks(previousStocks, currentStocks);
-
-//     // Per-scan added/removed alerts (unchanged behavior)
-//     if (removed.length > 0) {
-//       const msg = `🔴 *Exited: ${scanName}*\n${removed.join(", ")}\n${payload.triggered_at || ""}`;
-//       console.log(msg);
-//       await sendTelegramAlert(msg);
-//     }
-//     if (added.length > 0) {
-//       const msg = `🟢 *Entered: ${scanName}*\n${added.join(", ")}\n${payload.triggered_at || ""}`;
-//       console.log(msg);
-//       await sendTelegramAlert(msg);
-//     }
-
-//     // Update this scan's stored list
-//     state.scans[scanName] = currentStocks;
-
-//     // ---- Cross-scan intersection check (only runs if SCAN_A_NAME + SCAN_B_NAME are set) ----
-//     const newIntersection = computeIntersection(state);
-//     if (newIntersection !== null) {
-//       const prevIntersection = state.intersection;
-//       const enteredBoth = newIntersection.filter(
-//         (s) => !prevIntersection.includes(s),
-//       );
-//       const exitedBoth = prevIntersection.filter(
-//         (s) => !newIntersection.includes(s),
-//       );
-
-//       if (enteredBoth.length > 0) {
-//         const msg = `🟢 *ENTER (matched both filters)*\n${enteredBoth.join(", ")}\n${payload.triggered_at || ""}`;
-//         console.log(msg);
-//         await sendTelegramAlert(msg);
-//       }
-//       if (exitedBoth.length > 0) {
-//         const msg = `🔴 *EXIT (no longer matching both)*\n${exitedBoth.join(", ")}\n${payload.triggered_at || ""}`;
-//         console.log(msg);
-//         await sendTelegramAlert(msg);
-//       }
-
-//       state.intersection = newIntersection;
-//     }
-
-//     saveState(state);
-
-//     res.status(200).send("OK");
-//   } catch (err) {
-//     console.error("Webhook processing error:", err);
-//     res.status(500).send("Internal error");
-//   }
-// });
-
-// // Health check
-// app.get("/", (req, res) =>
-//   res.send("Chartink removed-stock webhook is running"),
-// );
-
-// app.listen(PORT, () => {
-//   console.log(`Webhook listening on port ${PORT}`);
-// });
 /**
  * chartink-removed-stock-webhook.js
  *
@@ -222,6 +55,10 @@ const PAPER_TRADE_QTY = Number(process.env.PAPER_TRADE_QTY) || 1;
 // Daily profit target: once today's NET P&L (after charges) hits this, close all
 // open paper positions and stop opening new ones until the next trading day.
 const PROFIT_TARGET = Number(process.env.PROFIT_TARGET) || 3000;
+
+// Per-trade take-profit: exit the moment price rises this many rupees above entry,
+// regardless of whether the stock is still in the scan.
+const TAKE_PROFIT_RS = Number(process.env.TAKE_PROFIT_RS) || 3;
 
 // ---------- IST date helper (for daily reset of profit target / halt flag) ----------
 function getISTDateString() {
@@ -341,7 +178,7 @@ function openPaperPosition(state, symbol, price, time) {
   return state.paperPositions[symbol];
 }
 
-function closePaperPosition(state, symbol, exitPrice, time) {
+function closePaperPosition(state, symbol, exitPrice, time, exitReason) {
   if (!state.paperPositions || !state.paperPositions[symbol]) return null;
   const pos = state.paperPositions[symbol];
 
@@ -365,6 +202,7 @@ function closePaperPosition(state, symbol, exitPrice, time) {
     entryTime: pos.entryTime,
     exitPrice,
     exitTime: time,
+    exitReason: exitReason || "unspecified",
     qty: pos.qty,
     grossPnl: Number(grossPnl.toFixed(2)),
     charges,
@@ -436,24 +274,58 @@ app.post("/webhook", async (req, res) => {
       await sendTelegramAlert(msg);
     }
 
-    // Dropped out -> paper sell, with full cost breakdown
+    // ---- Take-profit check: any OPEN position with a fresh price this cycle that has
+    // gained >= TAKE_PROFIT_RS above entry gets exited immediately, scan status aside ----
+    for (const symbol of Object.keys(state.paperPositions || {})) {
+      const currentPrice = priceMap[symbol]; // only symbols present in THIS payload have a fresh price
+      if (currentPrice === undefined) continue;
+      const pos = state.paperPositions[symbol];
+      if (currentPrice - pos.entryPrice >= TAKE_PROFIT_RS) {
+        const trade = closePaperPosition(
+          state,
+          symbol,
+          currentPrice,
+          payload.triggered_at,
+          "take_profit",
+        );
+        if (trade) {
+          const msg =
+            `🎯 *TAKE-PROFIT EXIT (+₹${TAKE_PROFIT_RS} hit)*\n${symbol}: entry ₹${trade.entryPrice} → exit ₹${trade.exitPrice} x${trade.qty}\n` +
+            `Net P&L: ₹${trade.netPnl} (${trade.netPnlPct}%)\n` +
+            `Today's Net P&L: ₹${state.dailyNetPnl} | All-time: ₹${state.totalNetPnl}`;
+          console.log(msg);
+          await sendTelegramAlert(msg);
+        }
+      }
+    }
+
+    // ---- Dropped out of scan -> exit ONLY if still above entry price; otherwise hold ----
     for (const symbol of removed) {
-      const price = state.lastPrice[symbol]; // last known price before it dropped
-      const trade = closePaperPosition(
-        state,
-        symbol,
-        price,
-        payload.triggered_at,
-      );
-      if (trade) {
-        const emoji = trade.netPnl >= 0 ? "🟢" : "🔴";
-        const msg =
-          `${emoji} *PAPER SELL*\n${symbol}: entry ₹${trade.entryPrice} → exit ₹${trade.exitPrice} x${trade.qty}\n` +
-          `Gross P&L: ₹${trade.grossPnl}\n` +
-          `Charges: ₹${trade.charges.totalCharges} (brokerage ₹${trade.charges.brokerage}, STT ₹${trade.charges.stt}, exch ₹${trade.charges.exchangeTxn}, SEBI ₹${trade.charges.sebi}, stamp ₹${trade.charges.stampDuty}, GST ₹${trade.charges.gst})\n` +
-          `*Net P&L: ₹${trade.netPnl} (${trade.netPnlPct}%)*\n` +
-          `Today's Net P&L: ₹${state.dailyNetPnl} | All-time: ₹${state.totalNetPnl}\n` +
-          `${payload.triggered_at || ""}`;
+      const pos = state.paperPositions && state.paperPositions[symbol];
+      if (!pos) continue; // already closed via take-profit above, nothing left to do
+
+      const lastKnownPrice = state.lastPrice[symbol]; // last price seen before it disappeared from the scan
+      if (lastKnownPrice !== undefined && lastKnownPrice > pos.entryPrice) {
+        const trade = closePaperPosition(
+          state,
+          symbol,
+          lastKnownPrice,
+          payload.triggered_at,
+          "scan_removal_in_profit",
+        );
+        if (trade) {
+          const msg =
+            `🟢 *EXIT — removed from scan (still in profit)*\n${symbol}: entry ₹${trade.entryPrice} → exit ₹${trade.exitPrice} x${trade.qty}\n` +
+            `Gross P&L: ₹${trade.grossPnl}\n` +
+            `Charges: ₹${trade.charges.totalCharges} (brokerage ₹${trade.charges.brokerage}, STT ₹${trade.charges.stt}, exch ₹${trade.charges.exchangeTxn}, SEBI ₹${trade.charges.sebi}, stamp ₹${trade.charges.stampDuty}, GST ₹${trade.charges.gst})\n` +
+            `*Net P&L: ₹${trade.netPnl} (${trade.netPnlPct}%)*\n` +
+            `Today's Net P&L: ₹${state.dailyNetPnl} | All-time: ₹${state.totalNetPnl}\n` +
+            `${payload.triggered_at || ""}`;
+          console.log(msg);
+          await sendTelegramAlert(msg);
+        }
+      } else {
+        const msg = `⚠️ *HOLD*\n${symbol} left the scan but price ₹${lastKnownPrice ?? "N/A"} is not above entry ₹${pos.entryPrice} — keeping position open (no stop-loss set).`;
         console.log(msg);
         await sendTelegramAlert(msg);
       }
@@ -469,6 +341,7 @@ app.post("/webhook", async (req, res) => {
           symbol,
           price,
           payload.triggered_at,
+          "daily_target_hit",
         );
         if (trade) {
           const msg =
